@@ -1,0 +1,106 @@
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #1e1e2e;
+  padding: 0 16px;
+  height: 52px;
+  border-bottom: 1px solid #2a2a3e;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.toolbar-left,
+.toolbar-center,
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.toolbar-center {
+  flex: 1;
+  justify-content: center;
+}
+
+.toolbar-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: #2d2d44;
+  border: 1px solid #3d3d5c;
+  color: #c8c8e0;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  white-space: nowrap;
+  line-height: 1;
+}
+
+.toolbar-btn:hover {
+  background: #3a3a58;
+  border-color: #5a5a88;
+  color: #ffffff;
+}
+
+.toolbar-btn--active {
+  background: #4a4a88;
+  border-color: #7070cc;
+  color: #c8caff;
+}
+
+.toolbar-btn--active:hover {
+  background: #5555aa;
+}
+
+.toolbar-btn--upload {
+  background: #264a38;
+  border-color: #3a7055;
+  color: #7de0a8;
+}
+
+.toolbar-btn--upload:hover {
+  background: #2e5c46;
+  border-color: #4a9070;
+  color: #a0f0c0;
+}
+
+.toolbar-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
+.toolbar-label {
+  font-size: 12px;
+}
+
+/* Stats section */
+.toolbar-stats {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.stats-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+}
+
+.stats-label {
+  font-size: 10px;
+  color: #7070a0;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.stats-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: #a0c8ff;
+  font-variant-numeric: tabular-nums;
+}
