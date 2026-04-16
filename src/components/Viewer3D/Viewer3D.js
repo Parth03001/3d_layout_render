@@ -94,6 +94,37 @@ function buildMeshFromResult(geometryMesh) {
   return { mesh, edges };
 }
 
+/**
+ * Parses a STEP file text and extracts the 3-D origin of every
+ * AXIS2_PLACEMENT_3D entity.  Used as a fallback when the file
+ * contains no BREP / tessellated geometry (assembly-only exports).
+ */
+function parseAssemblyPositions(text) {
+  // 1. Build a map of entity-id → [x, y, z] for all CARTESIAN_POINT entities.
+  const cartPoints = {};
+  const cpRegex = /#(\d+)=CARTESIAN_POINT\('[^']*',\(([^)]+)\)\)/g;
+  let m;
+  while ((m = cpRegex.exec(text)) !== null) {
+    const coords = m[2].split(',').map(s => parseFloat(s.trim()));
+    if (coords.length === 3 && !coords.some(isNaN)) {
+      cartPoints[m[1]] = coords;
+    }
+  }
+
+  // 2. For each AXIS2_PLACEMENT_3D, grab its first reference (#origin).
+  const seen = new Set();
+  const origins = [];
+  const axisRegex = /#\d+=AXIS2_PLACEMENT_3D\('[^']*',#(\d+)/g;
+  while ((m = axisRegex.exec(text)) !== null) {
+    const pid = m[1];
+    if (cartPoints[pid] && !seen.has(pid)) {
+      seen.add(pid);
+      origins.push(cartPoints[pid]);
+    }
+  }
+  return origins;
+}
+
 function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdges, wireframe, backgroundColor, controlsRef }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
@@ -175,8 +206,9 @@ function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdge
     scene.background = new THREE.Color(0xf5f5f5);
     sceneRef.current = scene;
 
-    // Grid helper
+    // Grid helper — rotated to XY plane so it lies flat in a Z-up world.
     const gridHelper = new THREE.GridHelper(20000, 20, 0xaaaaaa, 0xdddddd);
+    gridHelper.rotation.x = Math.PI / 2;
     scene.add(gridHelper);
 
     // Lights
@@ -239,22 +271,30 @@ function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdge
     async function load() {
       onLoadStart && onLoadStart();
       try {
+        console.log('[Viewer3D] Initialising OpenCASCADE WASM…');
         const occt = await occtimportjs({
-          locateFile: (path) => `${process.env.PUBLIC_URL}/${path}`,
+          locateFile: (path) => {
+            const base = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
+            return `${base}/${path}`;
+          },
         });
+        console.log('[Viewer3D] WASM ready. Fetching model:', modelUrl);
 
         const response = await fetch(modelUrl);
         if (!response.ok) throw new Error(`HTTP ${response.status} — could not fetch model`);
         const buffer = await response.arrayBuffer();
         const fileBuffer = new Uint8Array(buffer);
+        console.log('[Viewer3D] File fetched — size:', fileBuffer.length, 'bytes');
 
         const result = occt.ReadStepFile(fileBuffer, null);
+        console.log('[Viewer3D] ReadStepFile → success:', result.success,
+          '| meshes:', result.meshes ? result.meshes.length : 'undefined');
         if (!result.success) throw new Error('STEP parsing failed — invalid or unsupported file');
 
         if (cancelled) return;
 
         const modelGroup = modelGroupRef.current;
-        // Remove previous model children
+        // Clear any previously loaded model.
         while (modelGroup.children.length > 0) {
           const child = modelGroup.children[0];
           if (child.geometry) child.geometry.dispose();
@@ -266,15 +306,59 @@ function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdge
         let totalVertices = 0;
         const group = new THREE.Group();
 
-        for (const meshData of result.meshes) {
-          const { mesh, edges } = buildMeshFromResult(meshData);
-          group.add(mesh);
-          totalTriangles += meshData.index.array.length / 3;
-          totalVertices += meshData.attributes.position.array.length / 3;
-          if (edges) {
-            group.add(edges);
-            edgeGroupsRef.current.push(edges);
+        if (result.meshes.length > 0) {
+          // ── Normal path: BREP / tessellated geometry found ──────────────
+          for (const meshData of result.meshes) {
+            const { mesh, edges } = buildMeshFromResult(meshData);
+            group.add(mesh);
+            totalTriangles += meshData.index.array.length / 3;
+            totalVertices += meshData.attributes.position.array.length / 3;
+            if (edges) {
+              group.add(edges);
+              edgeGroupsRef.current.push(edges);
+            }
           }
+        } else {
+          // ── Fallback: assembly-only export — no solid geometry ───────────
+          // The file contains STEP assembly structure (PRODUCT hierarchy +
+          // AXIS2_PLACEMENT_3D transforms) but no renderable BREP faces.
+          // Extract every coordinate-system origin and render them as a
+          // point cloud so the factory layout is still visible.
+          console.warn('[Viewer3D] No mesh geometry returned. Parsing STEP text for assembly positions…');
+          const fileText = new TextDecoder().decode(buffer);
+          const positions = parseAssemblyPositions(fileText);
+          console.log('[Viewer3D] Assembly positions found:', positions.length);
+
+          if (positions.length === 0) {
+            throw new Error(
+              'No 3D geometry found in this STEP file. ' +
+              'It appears to be an assembly-only export without solid bodies. ' +
+              'Please re-export from CATIA with "Save as STEP with geometry" enabled.'
+            );
+          }
+
+          // Build a BufferGeometry point cloud from the extracted origins.
+          const posArray = new Float32Array(positions.length * 3);
+          positions.forEach(([x, y, z], i) => {
+            posArray[i * 3]     = x;
+            posArray[i * 3 + 1] = y;
+            posArray[i * 3 + 2] = z;
+          });
+          const ptGeom = new THREE.BufferGeometry();
+          ptGeom.setAttribute('position', new THREE.Float32BufferAttribute(posArray, 3));
+          const ptMat = new THREE.PointsMaterial({
+            color: 0x4488cc,
+            size: 300,
+            sizeAttenuation: true,
+          });
+          group.add(new THREE.Points(ptGeom, ptMat));
+          totalVertices = positions.length;
+
+          console.warn(
+            '[Viewer3D] Rendering', positions.length,
+            'component-placement origins as a point cloud.',
+            'Re-export the STEP file with geometry to see solid bodies.'
+          );
         }
 
         modelGroup.add(group);
