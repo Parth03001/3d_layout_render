@@ -77,6 +77,38 @@ html, body, #root {
   letter-spacing: 0.3px;
 }
 
+/* ── Warning banner (no-geometry fallback) ── */
+.warning-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #3a2800;
+  border-bottom: 1px solid #886600;
+  color: #ffcc44;
+  font-size: 12.5px;
+  padding: 7px 16px;
+  flex-shrink: 0;
+}
+.warning-banner__icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+.warning-banner__text {
+  flex: 1;
+  line-height: 1.4;
+}
+.warning-banner__close {
+  background: none;
+  border: none;
+  color: #ffcc44;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+.warning-banner__close:hover { opacity: 1; }
+
 /* ── Viewer area ── */
 .app-viewer {
   flex: 1;

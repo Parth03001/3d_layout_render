@@ -17,6 +17,7 @@ function App() {
   const [modelUrl, setModelUrl] = useState(DEFAULT_MODEL_URL);
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState(null);
+  const [loadWarning, setLoadWarning] = useState(null);
   const [stats, setStats] = useState(null);
   const [wireframe, setWireframe] = useState(false);
   const [showEdges, setShowEdges] = useState(true);
@@ -26,12 +27,14 @@ function App() {
   const handleLoadStart = useCallback(() => {
     setIsLoading(true);
     setLoadError(null);
+    setLoadWarning(null);
     setStats(null);
   }, []);
 
   const handleLoadComplete = useCallback((info) => {
     setIsLoading(false);
     setStats(info);
+    setLoadWarning(info.warning || null);
   }, []);
 
   const handleLoadError = useCallback((msg) => {
@@ -86,6 +89,14 @@ function App() {
         onFileUpload={handleFileUpload}
         stats={stats}
       />
+
+      {loadWarning && (
+        <div className="warning-banner">
+          <span className="warning-banner__icon">&#9888;</span>
+          <span className="warning-banner__text">{loadWarning}</span>
+          <button className="warning-banner__close" onClick={() => setLoadWarning(null)}>&#10005;</button>
+        </div>
+      )}
 
       <div className="app-viewer">
         <Viewer3D

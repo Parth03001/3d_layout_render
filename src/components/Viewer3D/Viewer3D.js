@@ -99,6 +99,17 @@ function buildMeshFromResult(geometryMesh) {
  * AXIS2_PLACEMENT_3D entity.  Used as a fallback when the file
  * contains no BREP / tessellated geometry (assembly-only exports).
  */
+/**
+ * Parses a STEP file text and extracts the 3-D origin of every
+ * AXIS2_PLACEMENT_3D entity.  Used as a fallback when the file
+ * contains no BREP / tessellated geometry (assembly-only exports).
+ *
+ * Each ITEM_DEFINED_TRANSFORMATION has a "from" frame (always at the
+ * local origin, i.e. 0,0,0) and a "to" frame (the actual placement in
+ * the parent's coordinate system).  We skip any point whose distance
+ * from the world origin is below a threshold so those identity frames
+ * are excluded and we are left with the real placement positions.
+ */
 function parseAssemblyPositions(text) {
   // 1. Build a map of entity-id → [x, y, z] for all CARTESIAN_POINT entities.
   const cartPoints = {};
@@ -112,15 +123,19 @@ function parseAssemblyPositions(text) {
   }
 
   // 2. For each AXIS2_PLACEMENT_3D, grab its first reference (#origin).
+  //    Deduplicate and skip points that are at (or very close to) the
+  //    world origin — those are "identity from-frames", not real positions.
   const seen = new Set();
   const origins = [];
+  const MIN_DIST_SQ = 1; // skip anything within 1 mm of origin
   const axisRegex = /#\d+=AXIS2_PLACEMENT_3D\('[^']*',#(\d+)/g;
   while ((m = axisRegex.exec(text)) !== null) {
     const pid = m[1];
-    if (cartPoints[pid] && !seen.has(pid)) {
-      seen.add(pid);
-      origins.push(cartPoints[pid]);
-    }
+    if (!cartPoints[pid] || seen.has(pid)) continue;
+    seen.add(pid);
+    const [x, y, z] = cartPoints[pid];
+    if (x * x + y * y + z * z < MIN_DIST_SQ) continue; // skip identity frames
+    origins.push([x, y, z]);
   }
   return origins;
 }
@@ -207,7 +222,8 @@ function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdge
     sceneRef.current = scene;
 
     // Grid helper — rotated to XY plane so it lies flat in a Z-up world.
-    const gridHelper = new THREE.GridHelper(20000, 20, 0xaaaaaa, 0xdddddd);
+    // 400 000 mm = 400 m covers large factory-floor layouts comfortably.
+    const gridHelper = new THREE.GridHelper(400000, 40, 0x555577, 0x333355);
     gridHelper.rotation.x = Math.PI / 2;
     scene.add(gridHelper);
 
@@ -346,10 +362,26 @@ function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdge
           });
           const ptGeom = new THREE.BufferGeometry();
           ptGeom.setAttribute('position', new THREE.Float32BufferAttribute(posArray, 3));
+
+          // Draw a soft circle onto a canvas so the points look round, not square.
+          const ptCanvas = document.createElement('canvas');
+          ptCanvas.width = 64; ptCanvas.height = 64;
+          const ctx = ptCanvas.getContext('2d');
+          const grad = ctx.createRadialGradient(32, 32, 4, 32, 32, 28);
+          grad.addColorStop(0, 'rgba(100,180,255,1)');
+          grad.addColorStop(0.6, 'rgba(60,130,220,0.8)');
+          grad.addColorStop(1, 'rgba(30,80,180,0)');
+          ctx.fillStyle = grad;
+          ctx.beginPath(); ctx.arc(32, 32, 30, 0, Math.PI * 2); ctx.fill();
+          const ptTex = new THREE.CanvasTexture(ptCanvas);
+
           const ptMat = new THREE.PointsMaterial({
-            color: 0x4488cc,
-            size: 300,
+            map: ptTex,
+            size: 2500,           // 2.5 m — visible at factory scale
             sizeAttenuation: true,
+            transparent: true,
+            depthWrite: false,
+            color: 0xffffff,      // tint applied via texture colours above
           });
           group.add(new THREE.Points(ptGeom, ptMat));
           totalVertices = positions.length;
@@ -368,6 +400,11 @@ function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdge
           meshCount: result.meshes.length,
           triangles: Math.round(totalTriangles),
           vertices: Math.round(totalVertices),
+          // Non-null only when no solid geometry was found in the file.
+          warning: result.meshes.length === 0
+            ? `No 3D geometry in this STEP file — showing ${totalVertices.toLocaleString()} component locations. ` +
+              `Re-export from CATIA using File → Save As → STEP and ensure "Include geometry" is enabled.`
+            : null,
         });
       } catch (err) {
         if (!cancelled) {
