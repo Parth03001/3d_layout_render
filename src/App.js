@@ -58,7 +58,23 @@ function App() {
 
   function handleFileUpload(file) {
     const ext = file.name.split('.').pop().toLowerCase();
-    setModelType(ext === 'wrl' ? 'wrl' : 'stp');
+    const isWRL = ext === 'wrl';
+
+    // Warn before loading very large WRL files — the VRML lexer is memory-
+    // intensive even inside a worker, and extremely large files can still
+    // exhaust the browser process.
+    const WRL_WARN_BYTES = 300 * 1024 * 1024; // 300 MB
+    if (isWRL && file.size > WRL_WARN_BYTES) {
+      const mb = (file.size / 1024 / 1024).toFixed(0);
+      const ok = window.confirm(
+        `This WRL file is ${mb} MB.\n\n` +
+        `Very large VRML files may cause the browser tab to crash during parsing.\n\n` +
+        `Proceed anyway?`
+      );
+      if (!ok) return;
+    }
+
+    setModelType(isWRL ? 'wrl' : 'stp');
     setModelUrl(URL.createObjectURL(file));
   }
 

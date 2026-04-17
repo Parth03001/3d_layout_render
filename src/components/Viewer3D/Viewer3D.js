@@ -1,7 +1,6 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
-import { VRMLLoader } from 'three/examples/jsm/loaders/VRMLLoader';
 import occtimportjs from 'occt-import-js';
 import './Viewer3D.css';
 
@@ -151,6 +150,73 @@ async function detectFileHeader(url) {
   }
 }
 
+/**
+ * Parse a VRML file inside a Web Worker so the main-thread V8 heap is never
+ * burdened with the full file string + THREE.js parser recursion.
+ * Returns { group, meshCount, totalTriangles, totalVertices }.
+ */
+function loadVRMLInWorker(url, onProgress) {
+  return new Promise((resolve, reject) => {
+    // webpack 5 / CRA 5 worker bundling via import.meta.url
+    const worker = new Worker(
+      new URL('./vrml.worker.js', import.meta.url)
+    );
+
+    worker.onmessage = (e) => {
+      const msg = e.data;
+
+      if (msg.type === 'progress') {
+        if (msg.total > 0) onProgress?.(msg.loaded / msg.total);
+
+      } else if (msg.type === 'complete') {
+        worker.terminate();
+
+        // Reconstruct THREE.js objects on the main thread from the
+        // transferred typed arrays (zero-copy, no string allocation here).
+        const group = new THREE.Group();
+        for (const md of msg.meshes) {
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute('position', new THREE.BufferAttribute(md.posArr, 3));
+          if (md.normArr) geometry.setAttribute('normal', new THREE.BufferAttribute(md.normArr, 3));
+          if (md.idxArr)  geometry.setIndex(new THREE.BufferAttribute(md.idxArr, 1));
+          geometry.name = md.name;
+
+          const mats = md.colors.map((c) =>
+            new THREE.MeshPhongMaterial({
+              color: c ? new THREE.Color(c[0], c[1], c[2]) : new THREE.Color(0x88aacc),
+              specular: new THREE.Color(0x333333),
+              shininess: 40,
+              side: THREE.DoubleSide,
+            })
+          );
+
+          const mesh = new THREE.Mesh(geometry, mats.length === 1 ? mats[0] : mats);
+          mesh.name = md.name;
+          group.add(mesh);
+        }
+
+        resolve({
+          group,
+          meshCount:      msg.meshCount,
+          totalTriangles: msg.totalTriangles,
+          totalVertices:  msg.totalVertices,
+        });
+
+      } else if (msg.type === 'error') {
+        worker.terminate();
+        reject(new Error(msg.message));
+      }
+    };
+
+    worker.onerror = (e) => {
+      worker.terminate();
+      reject(new Error(e.message || 'VRML worker crashed'));
+    };
+
+    worker.postMessage({ url });
+  });
+}
+
 // Streaming fetch that calls onProgress(0‥1) as data arrives.
 async function fetchWithProgress(url, onProgress) {
   const resp = await fetch(url);
@@ -181,34 +247,6 @@ async function fetchWithProgress(url, onProgress) {
   let off = 0;
   for (const c of chunks) { out.set(c, off); off += c.length; }
   return out;
-}
-
-function loadVRML(url, onProgress) {
-  return new Promise((resolve, reject) => {
-    const loader = new VRMLLoader();
-    loader.load(
-      url,
-      (vrmlScene) => {
-        let meshCount = 0;
-        let triangles = 0;
-        let vertices = 0;
-        vrmlScene.traverse((child) => {
-          if (!child.isMesh) return;
-          meshCount++;
-          const geo = child.geometry;
-          if (geo.attributes.position) vertices += geo.attributes.position.count;
-          triangles += geo.index
-            ? geo.index.count / 3
-            : (geo.attributes.position ? geo.attributes.position.count / 3 : 0);
-        });
-        resolve({ scene: vrmlScene, meshCount, triangles: Math.round(triangles), vertices });
-      },
-      (xhr) => {
-        if (xhr.total > 0) onProgress?.(xhr.loaded / xhr.total);
-      },
-      (err) => reject(err)
-    );
-  });
 }
 
 // Build THREE.js meshes in small batches, yielding between each batch so the
@@ -400,20 +438,24 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
 
           if (/vrml\s+v1\.0/i.test(header)) {
             throw new Error(
-              'VRML 1.0 format is not supported by the Three.js VRML loader. ' +
+              'VRML 1.0 format is not supported. ' +
               'Please re-export your model as VRML 2.0 (VRML97) from your CAD software ' +
               '(e.g. in CATIA: File → Save As → VRML → Version 2).'
             );
           }
 
-          const { scene: vrmlScene, meshCount, triangles, vertices } = await loadVRML(
+          // Parse inside a Web Worker — keeps the main-thread heap free and
+          // prevents Chrome STATUS_BREAKPOINT when parsing large WRL files.
+          onLoadProgress?.({ phase: 'parsing', progress: null });
+          const { group, meshCount, totalTriangles, totalVertices } = await loadVRMLInWorker(
             modelUrl,
             (p) => { if (!cancelled) onLoadProgress?.({ phase: 'downloading', progress: p }); }
           );
           if (cancelled) return;
-          modelGroup.add(vrmlScene);
+
+          modelGroup.add(group);
           fitCameraToModel();
-          onLoadComplete?.({ meshCount, triangles, vertices, warning: null });
+          onLoadComplete?.({ meshCount, triangles: totalTriangles, vertices: totalVertices, warning: null });
         } catch (err) {
           if (!cancelled) {
             console.error('[Viewer3D] WRL load error:', err);
