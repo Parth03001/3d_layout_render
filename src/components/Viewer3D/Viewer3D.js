@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
 import occtimportjs from 'occt-import-js';
 import './Viewer3D.css';
 
@@ -249,6 +250,37 @@ async function fetchWithProgress(url, onProgress) {
   return out;
 }
 
+// Load a pre-converted GLB (binary glTF) from the Python backend.
+// GLB is compact, binary, and THREE.js parses it without heavy string allocation.
+function loadGLTF(url, onProgress) {
+  return new Promise((resolve, reject) => {
+    const loader = new GLTFLoader();
+    loader.load(
+      url,
+      (gltf) => {
+        let meshCount = 0, totalTriangles = 0, totalVertices = 0;
+        gltf.scene.traverse((child) => {
+          if (!child.isMesh) return;
+          meshCount++;
+          const geo = child.geometry;
+          if (geo.attributes.position) totalVertices += geo.attributes.position.count;
+          totalTriangles += geo.index
+            ? geo.index.count / 3
+            : (geo.attributes.position ? geo.attributes.position.count / 3 : 0);
+        });
+        resolve({
+          scene: gltf.scene,
+          meshCount,
+          totalTriangles: Math.round(totalTriangles),
+          totalVertices,
+        });
+      },
+      (xhr) => { if (xhr.total > 0) onProgress?.(xhr.loaded / xhr.total); },
+      reject
+    );
+  });
+}
+
 // Build THREE.js meshes in small batches, yielding between each batch so the
 // browser stays responsive and avoids triggering the OOM killer.
 async function buildMeshesChunked(meshResults, onProgress) {
@@ -427,6 +459,25 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
         modelGroup.remove(child);
       }
       edgeGroupsRef.current = [];
+
+      // ── GLB path (backend-converted VRML/STEP) ────────────────────────
+      if (modelType === 'glb') {
+        try {
+          onLoadProgress?.({ phase: 'building', progress: null });
+          const { scene: gltfScene, meshCount, totalTriangles, totalVertices } =
+            await loadGLTF(
+              modelUrl,
+              (p) => { if (!cancelled) onLoadProgress?.({ phase: 'building', progress: p }); }
+            );
+          if (cancelled) return;
+          modelGroup.add(gltfScene);
+          fitCameraToModel();
+          onLoadComplete?.({ meshCount, triangles: totalTriangles, vertices: totalVertices, warning: null });
+        } catch (err) {
+          if (!cancelled) onLoadError?.('GLB load failed: ' + (err.message || err));
+        }
+        return;
+      }
 
       // ── WRL / VRML path ────────────────────────────────────────────────
       if (modelType === 'wrl') {

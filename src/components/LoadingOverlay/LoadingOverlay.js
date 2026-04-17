@@ -2,6 +2,8 @@ import React from 'react';
 import './LoadingOverlay.css';
 
 const PHASE_LABELS = {
+  uploading:   'Uploading to Python backend…',
+  converting:  'Converting VRML → GLB on server…',
   downloading: 'Downloading file…',
   parsing:     'Parsing geometry…',
   building:    'Building 3D meshes…',
