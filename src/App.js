@@ -62,46 +62,53 @@ function App() {
   async function handleFileUpload(file) {
     const ext = file.name.split('.').pop().toLowerCase();
     const isWRL = ext === 'wrl';
+    const fileMB = (file.size / 1024 / 1024).toFixed(1);
+
+    console.log(`[App] File selected: "${file.name}"  ${fileMB} MB  ext=${ext}`);
 
     // STEP files — continue using browser-side OpenCASCADE WASM
     if (!isWRL) {
+      console.log('[App] STEP file -> browser-side OpenCASCADE (no backend needed)');
       setModelType('stp');
       setModelUrl(URL.createObjectURL(file));
       return;
     }
 
-    // WRL files — try the Python backend first.
-    // The backend parses the VRML in Python (no V8 heap limit) and returns
-    // a compact GLB.  If the backend is not running we fall back to the
-    // Web Worker path with a size warning.
+    // WRL files — probe the Python backend, fall back to worker if unavailable
+    console.log(`[App] WRL file -> probing backend at ${BACKEND_URL}/health ...`);
     let backendAvailable = false;
     try {
-      const r = await fetch(`${BACKEND_URL}/health`, {
-        signal: AbortSignal.timeout(2500),
-      });
+      // AbortSignal.timeout() has spotty browser support — use AbortController instead
+      const ctrl = new AbortController();
+      const tid  = setTimeout(() => ctrl.abort(), 3000);
+      const r    = await fetch(`${BACKEND_URL}/health`, { signal: ctrl.signal });
+      clearTimeout(tid);
       backendAvailable = r.ok;
-    } catch { /* backend not running */ }
+      console.log(`[App] Backend health -> HTTP ${r.status}  available=${backendAvailable}`);
+    } catch (err) {
+      console.warn('[App] Backend health check failed:', err.message,
+        '-> will use browser-side worker fallback');
+    }
 
     if (!backendAvailable) {
-      // Fall back to browser-side worker, warn for large files
-      const WRL_WARN = 200 * 1024 * 1024; // 200 MB
+      console.log(`[App] Backend unavailable. File=${fileMB} MB, warn threshold=200 MB`);
+      const WRL_WARN = 200 * 1024 * 1024;
       if (file.size > WRL_WARN) {
-        const mb = (file.size / 1024 / 1024).toFixed(0);
         const ok = window.confirm(
           `The Python backend is not running.\n\n` +
           `Start it with:\n  cd backend\n  pip install -r requirements.txt\n  uvicorn main:app --port 8000\n\n` +
-          `Without the backend this ${mb} MB WRL file may crash the browser tab.\n\n` +
-          `Load in browser anyway?`
+          `Without the backend this ${fileMB} MB WRL file may crash the browser tab.\n\nLoad in browser anyway?`
         );
-        if (!ok) return;
+        if (!ok) { console.log('[App] User cancelled'); return; }
       }
+      console.log('[App] -> falling back to browser-side VRML worker');
       setModelType('wrl');
       setModelUrl(URL.createObjectURL(file));
       return;
     }
 
-    // ── Backend is available — upload and convert ────────────────────────
-    // Show the loading overlay immediately so the user sees progress
+    // Backend is available — upload and convert
+    console.log(`[App] -> uploading ${fileMB} MB to ${BACKEND_URL}/api/convert`);
     setIsLoading(true);
     setLoadError(null);
     setLoadWarning(null);
@@ -120,36 +127,43 @@ function App() {
 
         xhr.upload.onprogress = (e) => {
           if (e.lengthComputable) {
+            const pct = ((e.loaded / e.total) * 100).toFixed(1);
+            console.log(`[App] Upload: ${pct}%  (${(e.loaded/1048576).toFixed(1)}/${(e.total/1048576).toFixed(1)} MB)`);
             setLoadPhase('uploading');
             setLoadProgress(e.loaded / e.total);
           }
         };
 
-        // Once all bytes are uploaded the backend is converting
         xhr.upload.onload = () => {
+          console.log('[App] Upload complete -> backend is now converting ...');
           setLoadPhase('converting');
           setLoadProgress(null);
         };
 
         xhr.onload = () => {
           if (xhr.status === 200) {
+            const glbMB = (xhr.response.byteLength / 1048576).toFixed(1);
+            console.log(`[App] Backend returned GLB: ${glbMB} MB`);
             resolve(new Uint8Array(xhr.response));
           } else {
-            try {
-              const msg = JSON.parse(new TextDecoder().decode(xhr.response));
-              reject(new Error(msg.detail || `HTTP ${xhr.status}`));
-            } catch {
-              reject(new Error(`Backend returned HTTP ${xhr.status}`));
-            }
+            let detail = `HTTP ${xhr.status}`;
+            try { detail = JSON.parse(new TextDecoder().decode(xhr.response)).detail || detail; }
+            catch { /* raw */ }
+            console.error('[App] Backend error:', detail);
+            reject(new Error(detail));
           }
         };
 
-        xhr.onerror = () => reject(new Error('Network error reaching backend'));
+        xhr.onerror = () => {
+          console.error('[App] XHR network error — is the backend actually running on port 8000?');
+          reject(new Error('Network error reaching backend'));
+        };
+
         xhr.send(formData);
       });
 
-      // Backend conversion done — hand off to Viewer3D (GLTFLoader)
-      // Clear the manual loading state; Viewer3D's onLoadStart takes over
+      // Backend done — hand GLB blob URL to Viewer3D (GLTFLoader)
+      console.log('[App] Backend conversion done -> handing GLB to Viewer3D (GLTFLoader)');
       setIsLoading(false);
       setLoadPhase(null);
       setLoadProgress(null);
@@ -159,6 +173,7 @@ function App() {
       setModelUrl(URL.createObjectURL(glbBlob));
 
     } catch (err) {
+      console.error('[App] handleFileUpload error:', err);
       setIsLoading(false);
       setLoadPhase(null);
       setLoadProgress(null);
