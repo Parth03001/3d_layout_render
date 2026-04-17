@@ -5,7 +5,10 @@ import { VRMLLoader } from 'three/examples/jsm/loaders/VRMLLoader';
 import occtimportjs from 'occt-import-js';
 import './Viewer3D.css';
 
-function buildMeshFromResult(geometryMesh) {
+// Meshes with more triangles than this skip EdgesGeometry to prevent OOM
+const MAX_EDGE_TRIANGLES = 50_000;
+
+function buildMeshFromResult(geometryMesh, skipEdges = false) {
   const geometry = new THREE.BufferGeometry();
 
   geometry.setAttribute(
@@ -40,7 +43,7 @@ function buildMeshFromResult(geometryMesh) {
   let edges = null;
 
   if (geometryMesh.brep_faces && geometryMesh.brep_faces.length > 0) {
-    edges = new THREE.Group();
+    if (!skipEdges) edges = new THREE.Group();
 
     for (let faceColor of geometryMesh.brep_faces) {
       const color = faceColor.color
@@ -73,14 +76,16 @@ function buildMeshFromResult(geometryMesh) {
       geometry.addGroup(firstIndex * 3, (lastIndex - firstIndex) * 3, materialIndex);
       triangleIndex = lastIndex;
 
-      const innerGeometry = new THREE.BufferGeometry();
-      innerGeometry.setAttribute('position', geometry.attributes.position);
-      if (geometryMesh.attributes.normal) {
-        innerGeometry.setAttribute('normal', geometry.attributes.normal);
+      if (!skipEdges) {
+        const innerGeometry = new THREE.BufferGeometry();
+        innerGeometry.setAttribute('position', geometry.attributes.position);
+        if (geometryMesh.attributes.normal) {
+          innerGeometry.setAttribute('normal', geometry.attributes.normal);
+        }
+        innerGeometry.setIndex(new THREE.BufferAttribute(index.slice(firstIndex * 3, lastIndex * 3), 1));
+        const edgesGeometry = new THREE.EdgesGeometry(innerGeometry, 30);
+        edges.add(new THREE.LineSegments(edgesGeometry, outlineMaterial));
       }
-      innerGeometry.setIndex(new THREE.BufferAttribute(index.slice(firstIndex * 3, lastIndex * 3), 1));
-      const edgesGeometry = new THREE.EdgesGeometry(innerGeometry, 30);
-      edges.add(new THREE.LineSegments(edgesGeometry, outlineMaterial));
     }
   }
 
@@ -99,11 +104,6 @@ function buildMeshFromResult(geometryMesh) {
  * Parses a STEP file text and extracts the 3-D origin of every
  * AXIS2_PLACEMENT_3D entity.  Used as a fallback when the file
  * contains no BREP / tessellated geometry (assembly-only exports).
- */
-/**
- * Parses a STEP file text and extracts the 3-D origin of every
- * AXIS2_PLACEMENT_3D entity.  Used as a fallback when the file
- * contains no BREP / tessellated geometry (assembly-only exports).
  *
  * Each ITEM_DEFINED_TRANSFORMATION has a "from" frame (always at the
  * local origin, i.e. 0,0,0) and a "to" frame (the actual placement in
@@ -112,7 +112,6 @@ function buildMeshFromResult(geometryMesh) {
  * are excluded and we are left with the real placement positions.
  */
 function parseAssemblyPositions(text) {
-  // 1. Build a map of entity-id → [x, y, z] for all CARTESIAN_POINT entities.
   const cartPoints = {};
   const cpRegex = /#(\d+)=CARTESIAN_POINT\('[^']*',\(([^)]+)\)\)/g;
   let m;
@@ -123,25 +122,68 @@ function parseAssemblyPositions(text) {
     }
   }
 
-  // 2. For each AXIS2_PLACEMENT_3D, grab its first reference (#origin).
-  //    Deduplicate and skip points that are at (or very close to) the
-  //    world origin — those are "identity from-frames", not real positions.
   const seen = new Set();
   const origins = [];
-  const MIN_DIST_SQ = 1; // skip anything within 1 mm of origin
+  const MIN_DIST_SQ = 1;
   const axisRegex = /#\d+=AXIS2_PLACEMENT_3D\('[^']*',#(\d+)/g;
   while ((m = axisRegex.exec(text)) !== null) {
     const pid = m[1];
     if (!cartPoints[pid] || seen.has(pid)) continue;
     seen.add(pid);
     const [x, y, z] = cartPoints[pid];
-    if (x * x + y * y + z * z < MIN_DIST_SQ) continue; // skip identity frames
+    if (x * x + y * y + z * z < MIN_DIST_SQ) continue;
     origins.push([x, y, z]);
   }
   return origins;
 }
 
-function loadVRML(url) {
+// Read only the first network chunk of a URL to detect the file header.
+async function detectFileHeader(url) {
+  try {
+    const resp = await fetch(url);
+    if (!resp.body) return '';
+    const reader = resp.body.getReader();
+    const { value } = await reader.read();
+    reader.cancel().catch(() => {});
+    return value ? new TextDecoder().decode(value.slice(0, 300)) : '';
+  } catch {
+    return '';
+  }
+}
+
+// Streaming fetch that calls onProgress(0‥1) as data arrives.
+async function fetchWithProgress(url, onProgress) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} — could not fetch model`);
+
+  const total = parseInt(resp.headers.get('content-length') || '0', 10);
+
+  if (!resp.body || !total) {
+    onProgress?.(0.3);
+    const buf = await resp.arrayBuffer();
+    onProgress?.(1);
+    return new Uint8Array(buf);
+  }
+
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let received = 0;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    onProgress?.(received / total);
+  }
+
+  const out = new Uint8Array(received);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+
+function loadVRML(url, onProgress) {
   return new Promise((resolve, reject) => {
     const loader = new VRMLLoader();
     loader.load(
@@ -161,13 +203,42 @@ function loadVRML(url) {
         });
         resolve({ scene: vrmlScene, meshCount, triangles: Math.round(triangles), vertices });
       },
-      undefined,
+      (xhr) => {
+        if (xhr.total > 0) onProgress?.(xhr.loaded / xhr.total);
+      },
       (err) => reject(err)
     );
   });
 }
 
-function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadError, showEdges, wireframe, backgroundColor, controlsRef }) {
+// Build THREE.js meshes in small batches, yielding between each batch so the
+// browser stays responsive and avoids triggering the OOM killer.
+async function buildMeshesChunked(meshResults, onProgress) {
+  const group = new THREE.Group();
+  const edgeGroups = [];
+  let totalTriangles = 0;
+  let totalVertices = 0;
+  const CHUNK = 5;
+
+  for (let i = 0; i < meshResults.length; i += CHUNK) {
+    const batch = meshResults.slice(i, i + CHUNK);
+    for (const md of batch) {
+      const tris = md.index.array.length / 3;
+      const { mesh, edges } = buildMeshFromResult(md, tris > MAX_EDGE_TRIANGLES);
+      group.add(mesh);
+      totalTriangles += tris;
+      totalVertices += md.attributes.position.array.length / 3;
+      if (edges) { group.add(edges); edgeGroups.push(edges); }
+    }
+    onProgress?.(Math.min((i + CHUNK) / meshResults.length, 1));
+    // Yield to the browser to prevent main-thread starvation / OOM
+    await new Promise(r => setTimeout(r, 0));
+  }
+
+  return { group, edgeGroups, totalTriangles, totalVertices };
+}
+
+function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadError, onLoadProgress, showEdges, wireframe, backgroundColor, controlsRef }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
   const sceneRef = useRef(null);
@@ -248,13 +319,10 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
     scene.background = new THREE.Color(0xf5f5f5);
     sceneRef.current = scene;
 
-    // Grid helper — rotated to XY plane so it lies flat in a Z-up world.
-    // 400 000 mm = 400 m covers large factory-floor layouts comfortably.
     const gridHelper = new THREE.GridHelper(400000, 40, 0x555577, 0x333355);
     gridHelper.rotation.x = Math.PI / 2;
     scene.add(gridHelper);
 
-    // Lights
     const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
     scene.add(ambientLight);
 
@@ -312,7 +380,7 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
     let cancelled = false;
 
     async function load() {
-      onLoadStart && onLoadStart();
+      onLoadStart?.();
 
       const modelGroup = modelGroupRef.current;
       while (modelGroup.children.length > 0) {
@@ -325,16 +393,31 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
       // ── WRL / VRML path ────────────────────────────────────────────────
       if (modelType === 'wrl') {
         try {
-          console.log('[Viewer3D] Loading VRML/WRL file (this may take a while for large files)…');
-          const { scene: vrmlScene, meshCount, triangles, vertices } = await loadVRML(modelUrl);
+          // Check the VRML version from the first bytes before loading the full file
+          onLoadProgress?.({ phase: 'downloading', progress: 0 });
+          const header = await detectFileHeader(modelUrl);
+          if (cancelled) return;
+
+          if (/vrml\s+v1\.0/i.test(header)) {
+            throw new Error(
+              'VRML 1.0 format is not supported by the Three.js VRML loader. ' +
+              'Please re-export your model as VRML 2.0 (VRML97) from your CAD software ' +
+              '(e.g. in CATIA: File → Save As → VRML → Version 2).'
+            );
+          }
+
+          const { scene: vrmlScene, meshCount, triangles, vertices } = await loadVRML(
+            modelUrl,
+            (p) => { if (!cancelled) onLoadProgress?.({ phase: 'downloading', progress: p }); }
+          );
           if (cancelled) return;
           modelGroup.add(vrmlScene);
           fitCameraToModel();
-          onLoadComplete && onLoadComplete({ meshCount, triangles, vertices, warning: null });
+          onLoadComplete?.({ meshCount, triangles, vertices, warning: null });
         } catch (err) {
           if (!cancelled) {
             console.error('[Viewer3D] WRL load error:', err);
-            onLoadError && onLoadError('VRML parsing failed: ' + (err.message || err));
+            onLoadError?.('VRML parsing failed: ' + (err.message || err));
           }
         }
         return;
@@ -342,6 +425,7 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
 
       // ── STP / STEP path ────────────────────────────────────────────────
       try {
+        onLoadProgress?.({ phase: 'downloading', progress: 0 });
         console.log('[Viewer3D] Initialising OpenCASCADE WASM…');
         const occt = await occtimportjs({
           locateFile: (path) => {
@@ -349,45 +433,51 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
             return `${base}/${path}`;
           },
         });
+
+        if (cancelled) return;
         console.log('[Viewer3D] WASM ready. Fetching model:', modelUrl);
 
-        const response = await fetch(modelUrl);
-        if (!response.ok) throw new Error(`HTTP ${response.status} — could not fetch model`);
-        const buffer = await response.arrayBuffer();
-        const fileBuffer = new Uint8Array(buffer);
+        const fileBuffer = await fetchWithProgress(
+          modelUrl,
+          (p) => { if (!cancelled) onLoadProgress?.({ phase: 'downloading', progress: p }); }
+        );
+
+        if (cancelled) return;
         console.log('[Viewer3D] File fetched — size:', fileBuffer.length, 'bytes');
 
+        onLoadProgress?.({ phase: 'parsing', progress: null });
         const result = occt.ReadStepFile(fileBuffer, null);
         console.log('[Viewer3D] ReadStepFile → success:', result.success,
           '| meshes:', result.meshes ? result.meshes.length : 'undefined');
-        if (!result.success) throw new Error('STEP parsing failed — invalid or unsupported file');
 
+        if (!result.success) throw new Error('STEP parsing failed — invalid or unsupported file');
         if (cancelled) return;
 
         let totalTriangles = 0;
         let totalVertices = 0;
-        const group = new THREE.Group();
 
         if (result.meshes.length > 0) {
-          // ── Normal path: BREP / tessellated geometry found ──────────────
-          for (const meshData of result.meshes) {
-            const { mesh, edges } = buildMeshFromResult(meshData);
-            group.add(mesh);
-            totalTriangles += meshData.index.array.length / 3;
-            totalVertices += meshData.attributes.position.array.length / 3;
-            if (edges) {
-              group.add(edges);
-              edgeGroupsRef.current.push(edges);
-            }
-          }
+          // ── Normal path: BREP / tessellated geometry ────────────────────
+          onLoadProgress?.({ phase: 'building', progress: 0 });
+
+          const { group, edgeGroups, totalTriangles: tris, totalVertices: verts } =
+            await buildMeshesChunked(
+              result.meshes,
+              (p) => { if (!cancelled) onLoadProgress?.({ phase: 'building', progress: p }); }
+            );
+
+          if (cancelled) return;
+
+          totalTriangles = tris;
+          totalVertices = verts;
+          edgeGroupsRef.current = edgeGroups;
+          modelGroup.add(group);
         } else {
-          // ── Fallback: assembly-only export — no solid geometry ───────────
-          // The file contains STEP assembly structure (PRODUCT hierarchy +
-          // AXIS2_PLACEMENT_3D transforms) but no renderable BREP faces.
-          // Extract every coordinate-system origin and render them as a
-          // point cloud so the factory layout is still visible.
+          // ── Fallback: assembly-only export ──────────────────────────────
           console.warn('[Viewer3D] No mesh geometry returned. Parsing STEP text for assembly positions…');
-          const fileText = new TextDecoder().decode(buffer);
+          onLoadProgress?.({ phase: 'parsing', progress: null });
+
+          const fileText = new TextDecoder().decode(fileBuffer);
           const positions = parseAssemblyPositions(fileText);
           console.log('[Viewer3D] Assembly positions found:', positions.length);
 
@@ -399,7 +489,6 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
             );
           }
 
-          // Build a BufferGeometry point cloud from the extracted origins.
           const posArray = new Float32Array(positions.length * 3);
           positions.forEach(([x, y, z], i) => {
             posArray[i * 3]     = x;
@@ -409,7 +498,6 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
           const ptGeom = new THREE.BufferGeometry();
           ptGeom.setAttribute('position', new THREE.Float32BufferAttribute(posArray, 3));
 
-          // Draw a soft circle onto a canvas so the points look round, not square.
           const ptCanvas = document.createElement('canvas');
           ptCanvas.width = 64; ptCanvas.height = 64;
           const ctx = ptCanvas.getContext('2d');
@@ -423,30 +511,26 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
 
           const ptMat = new THREE.PointsMaterial({
             map: ptTex,
-            size: 2500,           // 2.5 m — visible at factory scale
+            size: 2500,
             sizeAttenuation: true,
             transparent: true,
             depthWrite: false,
-            color: 0xffffff,      // tint applied via texture colours above
+            color: 0xffffff,
           });
+          const group = new THREE.Group();
           group.add(new THREE.Points(ptGeom, ptMat));
+          modelGroup.add(group);
           totalVertices = positions.length;
 
-          console.warn(
-            '[Viewer3D] Rendering', positions.length,
-            'component-placement origins as a point cloud.',
-            'Re-export the STEP file with geometry to see solid bodies.'
-          );
+          console.warn('[Viewer3D] Rendering', positions.length, 'component-placement origins as a point cloud.');
         }
 
-        modelGroup.add(group);
         fitCameraToModel();
 
-        onLoadComplete && onLoadComplete({
+        onLoadComplete?.({
           meshCount: result.meshes.length,
           triangles: Math.round(totalTriangles),
           vertices: Math.round(totalVertices),
-          // Non-null only when no solid geometry was found in the file.
           warning: result.meshes.length === 0
             ? `No 3D geometry in this STEP file — showing ${totalVertices.toLocaleString()} component locations. ` +
               `Re-export from CATIA using File → Save As → STEP and ensure "Include geometry" is enabled.`
@@ -455,14 +539,14 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
       } catch (err) {
         if (!cancelled) {
           console.error('[Viewer3D] Load error:', err);
-          onLoadError && onLoadError(err.message || 'Unknown error');
+          onLoadError?.(err.message || 'Unknown error');
         }
       }
     }
 
     load();
     return () => { cancelled = true; };
-  }, [modelUrl, modelType, fitCameraToModel, onLoadStart, onLoadComplete, onLoadError]);
+  }, [modelUrl, modelType, fitCameraToModel, onLoadStart, onLoadComplete, onLoadError, onLoadProgress]);
 
   // Wireframe option
   useEffect(() => {

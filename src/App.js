@@ -23,6 +23,8 @@ function App() {
   const [wireframe, setWireframe] = useState(false);
   const [showEdges, setShowEdges] = useState(true);
   const [bgIndex, setBgIndex] = useState(0);
+  const [loadPhase, setLoadPhase] = useState(null);
+  const [loadProgress, setLoadProgress] = useState(null);
   const viewerControlsRef = useRef(null);
 
   const handleLoadStart = useCallback(() => {
@@ -30,16 +32,27 @@ function App() {
     setLoadError(null);
     setLoadWarning(null);
     setStats(null);
+    setLoadPhase(null);
+    setLoadProgress(null);
+  }, []);
+
+  const handleLoadProgress = useCallback(({ phase, progress }) => {
+    setLoadPhase(phase);
+    setLoadProgress(progress ?? null);
   }, []);
 
   const handleLoadComplete = useCallback((info) => {
     setIsLoading(false);
+    setLoadPhase(null);
+    setLoadProgress(null);
     setStats(info);
     setLoadWarning(info.warning || null);
   }, []);
 
   const handleLoadError = useCallback((msg) => {
     setIsLoading(false);
+    setLoadPhase(null);
+    setLoadProgress(null);
     setLoadError(msg);
   }, []);
 
@@ -107,12 +120,19 @@ function App() {
           onLoadStart={handleLoadStart}
           onLoadComplete={handleLoadComplete}
           onLoadError={handleLoadError}
+          onLoadProgress={handleLoadProgress}
           wireframe={wireframe}
           showEdges={showEdges}
           backgroundColor={BACKGROUNDS[currentBg]}
           controlsRef={viewerControlsRef}
         />
-        <LoadingOverlay isLoading={isLoading} error={loadError} modelType={modelType} />
+        <LoadingOverlay
+          isLoading={isLoading}
+          error={loadError}
+          modelType={modelType}
+          phase={loadPhase}
+          progress={loadProgress}
+        />
       </div>
     </div>
   );
