@@ -181,6 +181,66 @@ function App() {
     }
   }
 
+  async function handleLoadPath(filePath) {
+    console.log(`[App] Load-by-path: "${filePath}"`);
+
+    setIsLoading(true);
+    setLoadError(null);
+    setLoadWarning(null);
+    setStats(null);
+    setLoadPhase('converting');
+    setLoadProgress(null);
+
+    try {
+      const ctrl = new AbortController();
+      const tid  = setTimeout(() => ctrl.abort(), 3000);
+      const health = await fetch(`${BACKEND_URL}/health`, { signal: ctrl.signal });
+      clearTimeout(tid);
+      if (!health.ok) throw new Error('Backend not healthy');
+      console.log('[App] Backend available -> calling /api/convert-path');
+    } catch (err) {
+      setIsLoading(false);
+      setLoadPhase(null);
+      setLoadError(
+        'Python backend is not running.\n' +
+        'Start it with:  cd backend && uvicorn main:app --port 8000'
+      );
+      return;
+    }
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/convert-path`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: filePath }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+
+      const glbBuffer = await res.arrayBuffer();
+      const glbMB = (glbBuffer.byteLength / 1048576).toFixed(1);
+      console.log(`[App] Received GLB: ${glbMB} MB -> handing to Viewer3D`);
+
+      setIsLoading(false);
+      setLoadPhase(null);
+      setLoadProgress(null);
+
+      const glbBlob = new Blob([glbBuffer], { type: 'model/gltf-binary' });
+      setModelType('glb');
+      setModelUrl(URL.createObjectURL(glbBlob));
+
+    } catch (err) {
+      console.error('[App] convert-path error:', err);
+      setIsLoading(false);
+      setLoadPhase(null);
+      setLoadProgress(null);
+      setLoadError('Backend conversion failed: ' + err.message);
+    }
+  }
+
   function handleResetCamera() {
     viewerControlsRef.current?.resetCamera();
   }
@@ -221,6 +281,7 @@ function App() {
         background={currentBg}
         onCycleBackground={handleCycleBackground}
         onFileUpload={handleFileUpload}
+        onLoadPath={handleLoadPath}
         stats={stats}
       />
 
