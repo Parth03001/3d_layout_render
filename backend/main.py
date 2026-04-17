@@ -24,6 +24,7 @@ import time
 
 import trimesh
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from vrml_parser import load_vrml_as_scene
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -65,20 +66,25 @@ def _convert_path_to_glb(src_path: str, label: str) -> tuple[bytes, dict]:
     log.info("Source    : %s  (%.1f MB)", label, size_mb)
     t_parse = time.time()
 
-    loaded = trimesh.load(src_path, force="scene")
+    ext = src_path.rsplit(".", 1)[-1].lower() if "." in src_path else ""
+
+    if ext in ("wrl", "vrml"):
+        # trimesh does not support VRML — use the custom parser
+        log.info("Using custom VRML parser (trimesh does not support WRL)")
+        scene = load_vrml_as_scene(src_path)
+    else:
+        loaded = trimesh.load(src_path, force="scene")
+        if isinstance(loaded, trimesh.Trimesh):
+            log.info("Single mesh — wrapping in Scene")
+            scene = trimesh.Scene(geometry={"mesh": loaded})
+        elif isinstance(loaded, trimesh.Scene):
+            scene = loaded
+        else:
+            log.warning("Unexpected trimesh type: %s — empty scene", type(loaded))
+            scene = trimesh.Scene()
 
     elapsed_parse = time.time() - t_parse
     log.info("Parse done: %.2f s", elapsed_parse)
-
-    # Normalise to Scene
-    if isinstance(loaded, trimesh.Trimesh):
-        log.info("Single mesh — wrapping in Scene")
-        scene = trimesh.Scene(geometry={"mesh": loaded})
-    elif isinstance(loaded, trimesh.Scene):
-        scene = loaded
-    else:
-        log.warning("Unexpected trimesh type: %s — empty scene", type(loaded))
-        scene = trimesh.Scene()
 
     mesh_count     = len(scene.geometry)
     triangle_count = sum(len(g.faces)    for g in scene.geometry.values() if hasattr(g, "faces"))
