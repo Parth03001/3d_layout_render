@@ -1,23 +1,23 @@
 """
 Custom VRML 2.0 parser for CATIA-exported WRL files.
 
-CATIA WRL structure (each part is a Shape block):
+Key design: accumulate all geometry into flat numpy arrays during parsing
+and create ONE merged trimesh.Trimesh at the end.  The original approach of
+creating a separate Trimesh per Shape produced 778 000+ objects in the scene,
+making trimesh's GLB exporter hang because it serialises every mesh as a
+separate GLTF primitive.  A single merged mesh exports in seconds.
 
-  Shape {
-    appearance Appearance {
-      material Material { diffuseColor r g b }
-    }
-    geometry IndexedFaceSet {
-      coord Coordinate { point [ x y z, ... ] }
-      coordIndex [ i j k -1 ... ]
-      normal Normal { vector [ nx ny nz, ... ] }
-      normalIndex [ i j k -1 ... ]      (optional)
-    }
-  }
+CATIA WRL Shape structure:
 
-Transform nodes with translation/rotation wrap groups of Shape nodes.
-We collect all Shape blocks (with their Transform context) and convert
-each IndexedFaceSet into a trimesh.Trimesh, then return a trimesh.Scene.
+    Shape {
+        appearance Appearance {
+            material Material { diffuseColor r g b }
+        }
+        geometry IndexedFaceSet {
+            coord Coordinate { point [ x y z, ... ] }
+            coordIndex [ i j k -1 ... ]
+        }
+    }
 """
 
 import logging
@@ -28,175 +28,158 @@ import trimesh
 
 log = logging.getLogger(__name__)
 
-# ── Pre-compiled patterns ────────────────────────────────────────────────────
-
-_RE_COMMENT  = re.compile(r'#[^\n]*')
-_RE_DIFFUSE  = re.compile(
+# ── Pre-compiled patterns ─────────────────────────────────────────────────────
+_RE_COMMENT = re.compile(r'#[^\n]*')
+_RE_DIFFUSE = re.compile(
     r'diffuseColor\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)'
 )
-_RE_POINT_BLOCK  = re.compile(r'\bpoint\s*\[',  re.DOTALL)
-_RE_CIDX_BLOCK   = re.compile(r'\bcoordIndex\s*\[', re.DOTALL)
-_RE_FLOAT        = re.compile(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?')
-_RE_INT          = re.compile(r'-?\d+')
+_RE_POINT_OPEN = re.compile(r'\bpoint\s*\[')
+_RE_CIDX_OPEN  = re.compile(r'\bcoordIndex\s*\[')
+_RE_FLOAT = re.compile(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?')
+_RE_INT   = re.compile(r'-?\d+')
 
 
-# ── Brace-matched block extractor ─────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _block_after(content: str, start: int) -> tuple[str, int]:
-    """
-    Starting at *start*, find the next '{' and return the full balanced
-    '{...}' block plus the position just after its closing '}'.
-    Returns ('', -1) on failure.
-    """
+    """Return the balanced { ... } block that starts at or after *start*."""
     p = content.find('{', start)
     if p == -1:
         return '', -1
     depth = 0
     for i in range(p, len(content)):
-        ch = content[i]
-        if ch == '{':
+        c = content[i]
+        if c == '{':
             depth += 1
-        elif ch == '}':
+        elif c == '}':
             depth -= 1
             if depth == 0:
                 return content[p: i + 1], i + 1
     return '', -1
 
 
-def _bracket_content(content: str, start: int) -> tuple[str, int]:
-    """
-    Starting at *start*, find the next '[' and return everything inside
-    the matching ']', plus the position just after ']'.
-    """
-    p = content.find('[', start)
-    if p == -1:
+def _bracket_content(content: str, open_re: re.Pattern, start: int) -> tuple[str, int]:
+    """Find *open_re* (matches '...keyword [') from *start*, return content up to ']'."""
+    m = open_re.search(content, start)
+    if not m:
         return '', -1
+    bracket_start = m.end() - 1          # points at '['
+    p = content.find('[', bracket_start)
     q = content.find(']', p)
-    if q == -1:
+    if p == -1 or q == -1:
         return '', -1
     return content[p + 1: q], q + 1
 
 
-# ── Number parsing ────────────────────────────────────────────────────────────
-
-def _floats(text: str) -> np.ndarray:
+def _parse_floats(text: str) -> np.ndarray:
     return np.array(_RE_FLOAT.findall(text), dtype=np.float32)
 
 
-def _ints(text: str) -> list[int]:
+def _parse_indices(text: str) -> list[int]:
     return list(map(int, _RE_INT.findall(text)))
 
 
-# ── Fan-triangulate -1-terminated index list ──────────────────────────────────
-
-def _to_faces(indices: list[int]) -> np.ndarray | None:
+def _indices_to_faces(indices: list[int]) -> np.ndarray | None:
+    """Convert -1-terminated VRML index list to Nx3 triangle array."""
     faces: list[list[int]] = []
-    face: list[int] = []
+    poly: list[int] = []
     for idx in indices:
         if idx == -1:
-            n = len(face)
+            n = len(poly)
             if n == 3:
-                faces.append(face)
-            elif n > 3:                          # convex polygon → fan
+                faces.append(poly)
+            elif n > 3:
                 for i in range(1, n - 1):
-                    faces.append([face[0], face[i], face[i + 1]])
-            face = []
+                    faces.append([poly[0], poly[i], poly[i + 1]])
+            poly = []
         else:
-            face.append(idx)
-    # flush final face if file omits trailing -1
-    n = len(face)
+            poly.append(idx)
+    # flush final polygon if trailing -1 is absent
+    n = len(poly)
     if n == 3:
-        faces.append(face)
+        faces.append(poly)
     elif n > 3:
         for i in range(1, n - 1):
-            faces.append([face[0], face[i], face[i + 1]])
+            faces.append([poly[0], poly[i], poly[i + 1]])
     return np.array(faces, dtype=np.int32) if faces else None
 
 
-# ── Single Shape parser ───────────────────────────────────────────────────────
+# ── Per-shape raw data extractor ──────────────────────────────────────────────
 
-def _parse_shape(block: str) -> trimesh.Trimesh | None:
-    # ── colour ──
-    color = np.array([0.75, 0.75, 0.8, 1.0], dtype=np.float32)
+def _extract_shape(block: str):
+    """
+    Return (vertices Nx3 float32, faces Mx3 int32, color 4-element uint8)
+    or None if the block has no usable geometry.
+    """
+    # colour
+    color = np.array([192, 192, 204, 255], dtype=np.uint8)   # default light-grey
     m = _RE_DIFFUSE.search(block)
     if m:
-        color[:3] = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        r, g, b = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        color[:3] = np.clip([r, g, b], 0, 1) * 255
 
-    # ── vertices (coord Coordinate { point [ ... ] }) ──
-    m2 = _RE_POINT_BLOCK.search(block)
-    if not m2:
-        return None
-    raw_pts, _ = _bracket_content(block, m2.start())
+    # vertices
+    raw_pts, _ = _bracket_content(block, _RE_POINT_OPEN, 0)
     if not raw_pts:
         return None
-    verts = _floats(raw_pts)
-    if len(verts) == 0 or len(verts) % 3 != 0:
+    vf = _parse_floats(raw_pts)
+    if len(vf) == 0 or len(vf) % 3 != 0:
         return None
-    vertices = verts.reshape(-1, 3)
+    vertices = vf.reshape(-1, 3)
 
-    # ── face indices (coordIndex [ ... ]) ──
-    m3 = _RE_CIDX_BLOCK.search(block)
-    if not m3:
-        return None
-    raw_idx, _ = _bracket_content(block, m3.start())
+    # face indices
+    raw_idx, _ = _bracket_content(block, _RE_CIDX_OPEN, 0)
     if not raw_idx:
         return None
-    faces = _to_faces(_ints(raw_idx))
+    faces = _indices_to_faces(_parse_indices(raw_idx))
     if faces is None or len(faces) == 0:
         return None
 
-    # guard against out-of-range indices
-    if faces.max() >= len(vertices):
-        faces = faces[faces.max(axis=1) < len(vertices)]
-        if len(faces) == 0:
-            return None
+    # drop faces that reference a vertex out of bounds
+    valid = faces.max(axis=1) < len(vertices)
+    if not valid.all():
+        faces = faces[valid]
+    if len(faces) == 0:
+        return None
 
-    face_colors = np.tile(
-        (color * 255).astype(np.uint8), (len(faces), 1)
-    )
-
-    return trimesh.Trimesh(
-        vertices=vertices,
-        faces=faces,
-        face_colors=face_colors,
-        process=False,
-    )
+    return vertices, faces, color
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def load_vrml_as_scene(filepath: str) -> trimesh.Scene:
     """
-    Parse *filepath* (VRML 2.0 / VRML97) and return a trimesh.Scene.
-    Optimised for large CATIA WRL exports with thousands of Shape nodes.
+    Parse *filepath* (VRML 2.0) and return a trimesh.Scene containing a
+    single merged mesh.  Creating one mesh instead of one-per-Shape reduces
+    the GLTF primitive count from ~800 000 to 1, making GLB export instant.
     """
-    log.info("Reading %s into memory …", filepath)
+    log.info("Reading %s …", filepath)
     with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
         content = fh.read()
+    log.info("In RAM: %.1f MB", len(content) / 1_048_576)
 
-    log.info("File size in RAM: %.1f MB  (%d chars)", len(content) / 1_048_576, len(content))
-
-    # Strip VRML line comments so they don't confuse the parsers
     content = _RE_COMMENT.sub('', content)
 
-    scene      = trimesh.Scene()
-    mesh_count = 0
-    skip_count = 0
-    pos        = 0
-    kw         = 'Shape'
-    kw_len     = len(kw)
+    # Accumulate raw numpy arrays — NO per-shape Trimesh creation
+    vert_chunks:  list[np.ndarray] = []
+    face_chunks:  list[np.ndarray] = []
+    color_chunks: list[np.ndarray] = []
+
+    mesh_count = skip_count = 0
+    v_offset = 0
+    pos = 0
+    kw, kw_len = 'Shape', len('Shape')
 
     log.info("Scanning for Shape blocks …")
-
     while True:
         idx = content.find(kw, pos)
         if idx == -1:
             break
 
-        # Reject keywords that are part of a longer word (e.g. "DEF Shape …")
-        char_before = content[idx - 1] if idx > 0 else ' '
-        char_after  = content[idx + kw_len] if idx + kw_len < len(content) else ' '
-        if char_before.isalpha() or char_after.isalpha():
+        # Reject 'Shape' that is part of a longer identifier
+        before = content[idx - 1]  if idx > 0             else ' '
+        after  = content[idx + kw_len] if idx + kw_len < len(content) else ' '
+        if before.isalpha() or after.isalpha():
             pos = idx + kw_len
             continue
 
@@ -204,20 +187,59 @@ def load_vrml_as_scene(filepath: str) -> trimesh.Scene:
         if not block or next_pos == -1:
             pos = idx + kw_len
             continue
+        pos = next_pos
 
         try:
-            mesh = _parse_shape(block)
-            if mesh is not None and len(mesh.faces) > 0:
-                scene.add_geometry(mesh, geom_name=f'mesh_{mesh_count}')
-                mesh_count += 1
-                if mesh_count % 200 == 0:
-                    log.info("  … %d meshes parsed", mesh_count)
+            result = _extract_shape(block)
+            if result is None:
+                skip_count += 1
+                continue
+
+            vertices, faces, color = result
+            n_faces = len(faces)
+
+            vert_chunks.append(vertices)
+            face_chunks.append(faces + v_offset)
+            color_chunks.append(
+                np.tile(color, (n_faces, 1))   # broadcast colour to every face
+            )
+            v_offset   += len(vertices)
+            mesh_count += 1
+
+            if mesh_count % 5_000 == 0:
+                log.info("  … %d shapes accumulated", mesh_count)
+
         except Exception as exc:
             skip_count += 1
             if skip_count <= 5:
-                log.warning("Skipped shape #%d: %s", mesh_count + skip_count, exc)
+                log.warning("Skipped shape %d: %s", mesh_count + skip_count, exc)
 
-        pos = next_pos
+    log.info("Accumulated %d shapes (%d skipped) — merging into one mesh …",
+             mesh_count, skip_count)
 
-    log.info("Parsing complete: %d meshes  (%d skipped)", mesh_count, skip_count)
+    if not vert_chunks:
+        log.warning("No geometry found — returning empty scene")
+        return trimesh.Scene()
+
+    # ── One concatenation pass ────────────────────────────────────────────
+    all_vertices    = np.concatenate(vert_chunks,  axis=0)
+    all_faces       = np.concatenate(face_chunks,  axis=0)
+    all_face_colors = np.concatenate(color_chunks, axis=0)
+
+    log.info("Merged: %s vertices, %s triangles",
+             f"{len(all_vertices):,}", f"{len(all_faces):,}")
+
+    # Free chunk lists before creating the large Trimesh
+    del vert_chunks, face_chunks, color_chunks
+
+    merged = trimesh.Trimesh(
+        vertices=all_vertices,
+        faces=all_faces,
+        process=False,
+    )
+    merged.visual.face_colors = all_face_colors
+
+    scene = trimesh.Scene()
+    scene.add_geometry(merged, geom_name='layout')
+    log.info("Scene ready — 1 merged mesh, passing to GLB exporter …")
     return scene
