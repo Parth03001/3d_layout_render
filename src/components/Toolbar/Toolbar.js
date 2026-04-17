@@ -23,15 +23,15 @@ function Toolbar({
   return (
     <div className="toolbar">
       <div className="toolbar-left">
-        <label className="toolbar-btn toolbar-btn--upload" title="Upload STP / STEP file">
+        <label className="toolbar-btn toolbar-btn--upload" title="Upload STP / STEP / WRL file">
           <input
             type="file"
-            accept=".stp,.step,.STP,.STEP"
+            accept=".stp,.step,.STP,.STEP,.wrl,.WRL"
             onChange={handleFileChange}
             hidden
           />
           <span className="toolbar-icon">&#8679;</span>
-          <span className="toolbar-label">Upload STP</span>
+          <span className="toolbar-label">Upload Model</span>
         </label>
       </div>
 

@@ -15,6 +15,7 @@ const DEFAULT_MODEL_URL = `${process.env.PUBLIC_URL}/models/model.stp`;
 
 function App() {
   const [modelUrl, setModelUrl] = useState(DEFAULT_MODEL_URL);
+  const [modelType, setModelType] = useState('stp');
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState(null);
   const [loadWarning, setLoadWarning] = useState(null);
@@ -43,8 +44,9 @@ function App() {
   }, []);
 
   function handleFileUpload(file) {
-    const url = URL.createObjectURL(file);
-    setModelUrl(url);
+    const ext = file.name.split('.').pop().toLowerCase();
+    setModelType(ext === 'wrl' ? 'wrl' : 'stp');
+    setModelUrl(URL.createObjectURL(file));
   }
 
   function handleResetCamera() {
@@ -71,7 +73,7 @@ function App() {
         <div className="app-header-brand">
           <span className="app-header-icon">&#9719;</span>
           <span className="app-header-title">3D Layout Viewer</span>
-          <span className="app-header-subtitle">STEP / STP CAD Model Renderer</span>
+          <span className="app-header-subtitle">STEP / STP / WRL CAD Model Renderer</span>
         </div>
         <div className="app-header-meta">
           <span className="app-header-badge">OpenCASCADE + Three.js</span>
@@ -101,6 +103,7 @@ function App() {
       <div className="app-viewer">
         <Viewer3D
           modelUrl={modelUrl}
+          modelType={modelType}
           onLoadStart={handleLoadStart}
           onLoadComplete={handleLoadComplete}
           onLoadError={handleLoadError}
@@ -109,7 +112,7 @@ function App() {
           backgroundColor={BACKGROUNDS[currentBg]}
           controlsRef={viewerControlsRef}
         />
-        <LoadingOverlay isLoading={isLoading} error={loadError} />
+        <LoadingOverlay isLoading={isLoading} error={loadError} modelType={modelType} />
       </div>
     </div>
   );

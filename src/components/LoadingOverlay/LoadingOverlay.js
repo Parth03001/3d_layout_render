@@ -1,8 +1,10 @@
 import React from 'react';
 import './LoadingOverlay.css';
 
-function LoadingOverlay({ isLoading, error }) {
+function LoadingOverlay({ isLoading, error, modelType }) {
   if (!isLoading && !error) return null;
+
+  const isWRL = modelType === 'wrl';
 
   return (
     <div className={`loading-overlay ${error ? 'loading-overlay--error' : ''}`}>
@@ -15,8 +17,14 @@ function LoadingOverlay({ isLoading, error }) {
               <div className="spinner-ring spinner-ring--3"></div>
             </div>
             <p className="loading-title">Parsing 3D Model</p>
-            <p className="loading-sub">Loading STEP file via OpenCASCADE...</p>
-            <p className="loading-note">Large files may take up to 30 seconds</p>
+            <p className="loading-sub">
+              {isWRL ? 'Loading WRL file via Three.js VRML loader...' : 'Loading STEP file via OpenCASCADE...'}
+            </p>
+            <p className="loading-note">
+              {isWRL
+                ? 'Large WRL files (1 GB+) may take several minutes — please wait'
+                : 'Large files may take up to 30 seconds'}
+            </p>
           </>
         )}
 

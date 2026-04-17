@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useCallback } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
+import { VRMLLoader } from 'three/examples/jsm/loaders/VRMLLoader';
 import occtimportjs from 'occt-import-js';
 import './Viewer3D.css';
 
@@ -140,7 +141,33 @@ function parseAssemblyPositions(text) {
   return origins;
 }
 
-function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdges, wireframe, backgroundColor, controlsRef }) {
+function loadVRML(url) {
+  return new Promise((resolve, reject) => {
+    const loader = new VRMLLoader();
+    loader.load(
+      url,
+      (vrmlScene) => {
+        let meshCount = 0;
+        let triangles = 0;
+        let vertices = 0;
+        vrmlScene.traverse((child) => {
+          if (!child.isMesh) return;
+          meshCount++;
+          const geo = child.geometry;
+          if (geo.attributes.position) vertices += geo.attributes.position.count;
+          triangles += geo.index
+            ? geo.index.count / 3
+            : (geo.attributes.position ? geo.attributes.position.count / 3 : 0);
+        });
+        resolve({ scene: vrmlScene, meshCount, triangles: Math.round(triangles), vertices });
+      },
+      undefined,
+      (err) => reject(err)
+    );
+  });
+}
+
+function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadError, showEdges, wireframe, backgroundColor, controlsRef }) {
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
   const sceneRef = useRef(null);
@@ -286,6 +313,34 @@ function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdge
 
     async function load() {
       onLoadStart && onLoadStart();
+
+      const modelGroup = modelGroupRef.current;
+      while (modelGroup.children.length > 0) {
+        const child = modelGroup.children[0];
+        if (child.geometry) child.geometry.dispose();
+        modelGroup.remove(child);
+      }
+      edgeGroupsRef.current = [];
+
+      // ── WRL / VRML path ────────────────────────────────────────────────
+      if (modelType === 'wrl') {
+        try {
+          console.log('[Viewer3D] Loading VRML/WRL file (this may take a while for large files)…');
+          const { scene: vrmlScene, meshCount, triangles, vertices } = await loadVRML(modelUrl);
+          if (cancelled) return;
+          modelGroup.add(vrmlScene);
+          fitCameraToModel();
+          onLoadComplete && onLoadComplete({ meshCount, triangles, vertices, warning: null });
+        } catch (err) {
+          if (!cancelled) {
+            console.error('[Viewer3D] WRL load error:', err);
+            onLoadError && onLoadError('VRML parsing failed: ' + (err.message || err));
+          }
+        }
+        return;
+      }
+
+      // ── STP / STEP path ────────────────────────────────────────────────
       try {
         console.log('[Viewer3D] Initialising OpenCASCADE WASM…');
         const occt = await occtimportjs({
@@ -308,15 +363,6 @@ function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdge
         if (!result.success) throw new Error('STEP parsing failed — invalid or unsupported file');
 
         if (cancelled) return;
-
-        const modelGroup = modelGroupRef.current;
-        // Clear any previously loaded model.
-        while (modelGroup.children.length > 0) {
-          const child = modelGroup.children[0];
-          if (child.geometry) child.geometry.dispose();
-          modelGroup.remove(child);
-        }
-        edgeGroupsRef.current = [];
 
         let totalTriangles = 0;
         let totalVertices = 0;
@@ -416,7 +462,7 @@ function Viewer3D({ modelUrl, onLoadStart, onLoadComplete, onLoadError, showEdge
 
     load();
     return () => { cancelled = true; };
-  }, [modelUrl, fitCameraToModel, onLoadStart, onLoadComplete, onLoadError]);
+  }, [modelUrl, modelType, fitCameraToModel, onLoadStart, onLoadComplete, onLoadError]);
 
   // Wireframe option
   useEffect(() => {
