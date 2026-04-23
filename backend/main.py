@@ -25,6 +25,7 @@ import time
 import trimesh
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from vrml_parser import load_vrml_as_scene
+import gpu_accel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -37,6 +38,12 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="3D Model Converter API", version="1.0.0")
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    status = f"ENABLED — {gpu_accel.GPU_INFO}" if gpu_accel.GPU_AVAILABLE else "DISABLED"
+    log.info("GPU acceleration: %s", status)
 
 app.add_middleware(
     CORSMiddleware,
@@ -134,7 +141,12 @@ def _glb_response(glb_bytes: bytes, stats: dict) -> Response:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "trimesh": trimesh.__version__}
+    return {
+        "status": "ok",
+        "trimesh": trimesh.__version__,
+        "gpu_enabled": gpu_accel.GPU_AVAILABLE,
+        "gpu_info": gpu_accel.GPU_INFO,
+    }
 
 
 class PathRequest(BaseModel):
