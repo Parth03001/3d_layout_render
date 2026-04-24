@@ -5,7 +5,7 @@ import LoadingOverlay from './components/LoadingOverlay/LoadingOverlay';
 import './App.css';
 
 // Python backend base URL — override via REACT_APP_BACKEND_URL env var
-const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL || 'http://localhost:8000').replace(/\/$/, '');
+const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL || 'http://localhost:8003').replace(/\/$/, '');
 
 const BACKGROUNDS = {
   light: '#f5f5f5',

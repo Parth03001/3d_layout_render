@@ -1,314 +1,271 @@
 """
-Custom VRML 2.0 parser for CATIA-exported WRL files.
-
-Key design: accumulate all geometry into flat numpy arrays during parsing
-and create ONE merged trimesh.Trimesh at the end.  The original approach of
-creating a separate Trimesh per Shape produced 778 000+ objects in the scene,
-making trimesh's GLB exporter hang because it serialises every mesh as a
-separate GLTF primitive.  A single merged mesh exports in seconds.
-
-GPU acceleration (gpu_accel.py):
-- Final chunk concatenation runs on the RTX 4000 Ada via CuPy when the
-  dataset is large enough to justify the PCIe transfer.
-- Face validation and color tiling also offload to GPU for large arrays.
-
-CATIA WRL Shape structure:
-
-    Shape {
-        appearance Appearance {
-            material Material { diffuseColor r g b }
-        }
-        geometry IndexedFaceSet {
-            coord Coordinate { point [ x y z, ... ] }
-            coordIndex [ i j k -1 ... ]
-        }
-    }
+Advanced High-Performance VRML 2.0 Parser.
+Supports 4x4 Matrix Transformations (Rotation, Scale, Translation).
+Optimized for massive CATIA layouts with Zero-Copy indexing.
 """
 
 import logging
 import re
-
 import numpy as np
 import trimesh
-
 import gpu_accel
+import time
 
 log = logging.getLogger(__name__)
 
 # ── Pre-compiled patterns ─────────────────────────────────────────────────────
 _RE_COMMENT    = re.compile(r'#[^\n]*')
-_RE_DIFFUSE    = re.compile(
-    r'diffuseColor\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)'
-)
+_RE_DIFFUSE    = re.compile(r'diffuseColor\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)')
+_RE_TRANS      = re.compile(r'translation\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)')
+_RE_ROTATION   = re.compile(r'rotation\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)')
+_RE_SCALE      = re.compile(r'\bscale\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)')
 _RE_POINT_OPEN = re.compile(r'\bpoint\s*\[')
 _RE_CIDX_OPEN  = re.compile(r'\bcoordIndex\s*\[')
-# Regex fallbacks (only used when numpy fast-path fails)
 _RE_FLOAT      = re.compile(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?')
-_RE_INT        = re.compile(r'-?\d+')
+_RE_DEF_LINE   = re.compile(r'DEF\s+(?P<name>[^\s{]+)\s+(?P<type>[^\s{]+)')
+_RE_USE_LINE   = re.compile(r'USE\s+(?P<name>[^\s{}]+)')
+_RE_COORD_USE  = re.compile(r'coord\s+USE\s+([^\s}]+)')
+_RE_GEO_USE    = re.compile(r'geometry\s+USE\s+([^\s}]+)')
 
+# ── Matrix Math Helpers ───────────────────────────────────────────────────────
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def _get_matrix(translation=None, rotation=None, scale=None):
+    mat = np.eye(4, dtype=np.float32)
+    if scale is not None:
+        mat = mat @ np.diag([scale[0], scale[1], scale[2], 1.0]).astype(np.float32)
+    if rotation is not None:
+        x, y, z, angle = rotation
+        s, c = np.sin(angle), np.cos(angle)
+        t = 1 - c
+        norm = np.sqrt(x*x + y*y + z*z)
+        if norm > 1e-6:
+            x, y, z = x/norm, y/norm, z/norm
+            r_mat = np.array([
+                [t*x*x + c,   t*x*y - s*z, t*x*z + s*y, 0],
+                [t*x*y + s*z, t*y*y + c,   t*y*z - s*x, 0],
+                [t*x*z - s*y, t*y*z + s*x, t*z*z + c,   0],
+                [0,           0,           0,           1]
+            ], dtype=np.float32)
+            mat = mat @ r_mat
+    if translation is not None:
+        mat[0:3, 3] = translation
+    return mat
 
-def _block_after(content: str, start: int) -> tuple[str, int]:
-    """Return the balanced { ... } block that starts at or after *start*."""
+def _apply_transform(vertices, matrix):
+    if vertices is None or len(vertices) == 0: return vertices
+    v_h = np.hstack([vertices, np.ones((len(vertices), 1), dtype=np.float32)])
+    return (v_h @ matrix.T)[:, 0:3]
+
+# ── Zero-Copy Block Parsing ───────────────────────────────────────────────────
+
+def _block_end(content, start):
     p = content.find('{', start)
-    if p == -1:
-        return '', -1
-    depth = 0
-    for i in range(p, len(content)):
-        c = content[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return content[p: i + 1], i + 1
-    return '', -1
+    if p == -1: return -1
+    depth, curr = 1, p + 1
+    while depth > 0:
+        no, nc = content.find('{', curr), content.find('}', curr)
+        if nc == -1: return -1
+        if no != -1 and no < nc: depth += 1; curr = no + 1
+        else: depth -= 1; curr = nc + 1
+    return curr
 
-
-def _bracket_content(content: str, open_re: re.Pattern, start: int) -> tuple[str, int]:
-    """Find *open_re* (matches '...keyword [') from *start*, return content up to ']'."""
-    m = open_re.search(content, start)
-    if not m:
-        return '', -1
-    bracket_start = m.end() - 1          # points at '['
-    p = content.find('[', bracket_start)
+def _bracket_range(content, open_re, start, end):
+    m = open_re.search(content, start, end)
+    if not m: return -1, -1
+    p = content.find('[', m.end() - 1)
+    if p == -1 or p >= end: return -1, -1
     q = content.find(']', p)
-    if p == -1 or q == -1:
-        return '', -1
-    return content[p + 1: q], q + 1
+    return (p + 1, q) if q != -1 and q < end else (-1, -1)
 
-
-def _parse_floats(text: str) -> np.ndarray:
-    """Parse floats from VRML coordinate text.
-
-    Uses numpy.fromstring (C extension) which is 10–50× faster than regex
-    for large vertex arrays. Falls back to regex on parse error.
-    """
+def _parse_floats_range(content, start, end):
+    chunk = content[start:end].replace(',', ' ')
     try:
-        clean = text.replace(',', ' ')
-        result = np.fromstring(clean, dtype=np.float32, sep=' ')
-        if len(result) > 0:
-            return result
-    except Exception:
-        pass
-    return np.array(_RE_FLOAT.findall(text), dtype=np.float32)
+        res = np.fromstring(chunk, dtype=np.float32, sep=' ')
+        if res.size > 0: return res
+    except: pass
+    return np.array(_RE_FLOAT.findall(chunk), dtype=np.float32)
 
-
-def _parse_indices(text: str) -> np.ndarray:
-    """Parse integers from VRML coordIndex text using numpy (fast path)."""
-    try:
-        clean = text.replace(',', ' ')
-        return np.fromstring(clean, dtype=np.int32, sep=' ')
-    except Exception:
-        return np.array(list(map(int, _RE_INT.findall(text))), dtype=np.int32)
-
-
-def _indices_to_faces(indices: np.ndarray) -> np.ndarray | None:
-    """Convert -1-terminated VRML index array to an Nx3 triangle array.
-
-    Fully vectorised: triangles and quads are handled with numpy fancy
-    indexing (no Python loop); n-gons use a loop but are rare in CATIA output.
-    """
-    if not isinstance(indices, np.ndarray):
-        indices = np.asarray(indices, dtype=np.int32)
-    if len(indices) == 0:
-        return None
-
-    # Ensure sentinel at end
-    if indices[-1] != -1:
-        indices = np.append(indices, np.int32(-1))
-
+def _indices_to_faces(indices):
+    if indices.size == 0: return None
+    if indices[-1] != -1: indices = np.append(indices, np.int32(-1))
     neg_pos = np.where(indices == -1)[0]
-    if len(neg_pos) == 0:
-        return None
-
+    if neg_pos.size == 0: return None
     starts = np.empty(len(neg_pos), dtype=np.int64)
-    starts[0] = 0
-    starts[1:] = neg_pos[:-1] + 1
+    starts[0], starts[1:] = 0, neg_pos[:-1] + 1
     lengths = (neg_pos - starts).astype(np.int64)
-
-    # Drop degenerate polygons
     valid = lengths >= 3
-    starts  = starts[valid]
-    lengths = lengths[valid]
-
-    if len(starts) == 0:
-        return None
-
-    face_list: list[np.ndarray] = []
-
-    # ── Triangles (most common in CATIA VRML) ────────────────────────────────
+    starts, lengths = starts[valid], lengths[valid]
+    if starts.size == 0: return None
+    face_list = []
     tri_mask = lengths == 3
     if tri_mask.any():
         ts = starts[tri_mask].astype(np.intp)
-        face_list.append(np.column_stack([
-            indices[ts],
-            indices[ts + 1],
-            indices[ts + 2],
-        ]))
-
-    # ── Quads (fan-triangulate to 2 triangles each) ───────────────────────────
+        face_list.append(np.column_stack([indices[ts], indices[ts+1], indices[ts+2]]))
     quad_mask = lengths == 4
     if quad_mask.any():
         qs = starts[quad_mask].astype(np.intp)
-        i0, i1, i2, i3 = (
-            indices[qs], indices[qs + 1], indices[qs + 2], indices[qs + 3]
-        )
+        i0, i1, i2, i3 = indices[qs], indices[qs+1], indices[qs+2], indices[qs+3]
         face_list.append(np.column_stack([i0, i1, i2]))
         face_list.append(np.column_stack([i0, i2, i3]))
+    return np.concatenate(face_list, axis=0).astype(np.int32) if face_list else None
 
-    # ── N-gons (rare — Python loop acceptable) ────────────────────────────────
-    ngon_mask = lengths > 4
-    if ngon_mask.any():
-        ngon_faces: list[list[int]] = []
-        for s, l in zip(starts[ngon_mask].tolist(), lengths[ngon_mask].tolist()):
-            poly = indices[int(s): int(s) + int(l)]
-            for i in range(1, int(l) - 1):
-                ngon_faces.append([int(poly[0]), int(poly[i]), int(poly[i + 1])])
-        if ngon_faces:
-            face_list.append(np.array(ngon_faces, dtype=np.int32))
+def _extract_geometry_range(content, start, end, def_map):
+    b_s, b_e = _bracket_range(content, _RE_POINT_OPEN, start, end)
+    vertices = None
+    if b_s != -1:
+        vf = _parse_floats_range(content, b_s, b_e)
+        if vf.size > 0 and vf.size % 3 == 0: vertices = vf.reshape(-1, 3)
+    else:
+        m_use = _RE_COORD_USE.search(content, start, end)
+        if m_use and m_use.group(1) in def_map:
+            res = def_map[m_use.group(1)]
+            vertices = res if isinstance(res, np.ndarray) else res[0]
+    if vertices is None: return None
+    b_s, b_e = _bracket_range(content, _RE_CIDX_OPEN, start, end)
+    if b_s == -1: return vertices, None
+    chunk = content[b_s:b_e].replace(',', ' ')
+    try:
+        idx_arr = np.fromstring(chunk, dtype=np.int32, sep=' ')
+    except:
+        idx_arr = np.array(re.findall(r'-?\d+', chunk), dtype=np.int32)
+    faces = _indices_to_faces(idx_arr)
+    if faces is not None: faces = gpu_accel.validate_faces(faces, len(vertices))
+    return vertices, faces
 
-    if not face_list:
-        return None
-
-    return np.concatenate(face_list, axis=0).astype(np.int32)
-
-
-# ── Per-shape raw data extractor ──────────────────────────────────────────────
-
-def _extract_shape(block: str):
-    """
-    Return (vertices Nx3 float32, faces Mx3 int32, color 4-element uint8)
-    or None if the block has no usable geometry.
-    """
-    # colour
+def _extract_shape_data_range(content, start, end, def_map):
     color = np.array([192, 192, 204, 255], dtype=np.uint8)
-    m = _RE_DIFFUSE.search(block)
+    m = _RE_DIFFUSE.search(content, start, end)
     if m:
         r, g, b = float(m.group(1)), float(m.group(2)), float(m.group(3))
         color[:3] = np.clip([r, g, b], 0, 1) * 255
-
-    # vertices
-    raw_pts, _ = _bracket_content(block, _RE_POINT_OPEN, 0)
-    if not raw_pts:
-        return None
-    vf = _parse_floats(raw_pts)
-    if len(vf) == 0 or len(vf) % 3 != 0:
-        return None
-    vertices = vf.reshape(-1, 3)
-
-    # face indices
-    raw_idx, _ = _bracket_content(block, _RE_CIDX_OPEN, 0)
-    if not raw_idx:
-        return None
-    idx_arr = _parse_indices(raw_idx)
-    faces = _indices_to_faces(idx_arr)
-    if faces is None or len(faces) == 0:
-        return None
-
-    # drop faces that reference an out-of-bounds vertex
-    if faces.size > 0:
-        faces = gpu_accel.validate_faces(faces, len(vertices))
-    if len(faces) == 0:
-        return None
-
-    return vertices, faces, color
-
-
-# ── Public entry point ────────────────────────────────────────────────────────
+    res = _extract_geometry_range(content, start, end, def_map)
+    if res is None:
+        m_use = _RE_GEO_USE.search(content, start, end)
+        if m_use and m_use.group(1) in def_map:
+            res = def_map[m_use.group(1)]
+            if isinstance(res, tuple): return res[0], res[1], color
+    else: return res[0], res[1], color
+    return None
 
 def load_vrml_as_scene(filepath: str) -> trimesh.Scene:
-    """
-    Parse *filepath* (VRML 2.0) and return a trimesh.Scene containing a
-    single merged mesh.  Creating one mesh instead of one-per-Shape reduces
-    the GLTF primitive count from ~800 000 to 1, making GLB export instant.
-    """
-    log.info("GPU status: %s", gpu_accel.GPU_INFO)
-    log.info("Reading %s …", filepath)
+    t0 = time.time()
+    log.info("Step 1/6: Reading file...")
     with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
         content = fh.read()
-    log.info("In RAM: %.1f MB", len(content) / 1_048_576)
-
     content = _RE_COMMENT.sub('', content)
+    
+    vert_chunks, face_chunks, color_chunks = [], [], []
+    def_map = {}
+    mesh_count = v_offset = 0
+    transform_stack = [(float('inf'), np.eye(4, dtype=np.float32))]
+    
+    kw_re = re.compile(r'\b(DEF|USE|Shape|Transform|Group)\b')
+    log.info("Step 3/6: Scanning keywords...")
+    matches = list(kw_re.finditer(content))
+    total_kw = len(matches)
+    
+    log.info("Step 4/6: Processing Hierarchy...")
+    i = 0
+    last_log = time.time()
+    while i < total_kw:
+        m = matches[i]
+        kw, start = m.group(1), m.start()
+        
+        while start > transform_stack[-1][0]:
+            transform_stack.pop()
 
-    vert_chunks:  list[np.ndarray] = []
-    face_chunks:  list[np.ndarray] = []
-    color_chunks: list[np.ndarray] = []
-
-    mesh_count = skip_count = 0
-    v_offset = 0
-    pos = 0
-    kw, kw_len = 'Shape', len('Shape')
-
-    log.info("Scanning for Shape blocks …")
-    while True:
-        idx = content.find(kw, pos)
-        if idx == -1:
-            break
-
-        before = content[idx - 1]         if idx > 0             else ' '
-        after  = content[idx + kw_len]    if idx + kw_len < len(content) else ' '
-        if before.isalpha() or after.isalpha():
-            pos = idx + kw_len
-            continue
-
-        block, next_pos = _block_after(content, idx + kw_len)
-        if not block or next_pos == -1:
-            pos = idx + kw_len
-            continue
-        pos = next_pos
-
-        try:
-            result = _extract_shape(block)
-            if result is None:
-                skip_count += 1
+        if kw in ('Transform', 'Group'):
+            n_pos = _block_end(content, start)
+            if n_pos != -1:
+                t_m, r_m, s_m = _RE_TRANS.search(content, start, n_pos), _RE_ROTATION.search(content, start, n_pos), _RE_SCALE.search(content, start, n_pos)
+                trans = [float(t_m.group(1)), float(t_m.group(2)), float(t_m.group(3))] if t_m else None
+                rot   = [float(r_m.group(1)), float(r_m.group(2)), float(r_m.group(3)), float(r_m.group(4))] if r_m else None
+                scale = [float(s_m.group(1)), float(s_m.group(2)), float(s_m.group(3))] if s_m else None
+                combined_mat = transform_stack[-1][1] @ _get_matrix(trans, rot, scale)
+                transform_stack.append((n_pos, combined_mat))
+            i += 1; continue
+            
+        elif kw == 'DEF':
+            m_def = _RE_DEF_LINE.match(content, start)
+            if m_def:
+                name, dtype = m_def.group('name'), m_def.group('type')
+                n_pos = _block_end(content, start)
+                if n_pos != -1:
+                    if dtype in ('Transform', 'Group'):
+                        t_m, r_m, s_m = _RE_TRANS.search(content, start, n_pos), _RE_ROTATION.search(content, start, n_pos), _RE_SCALE.search(content, start, n_pos)
+                        trans = [float(t_m.group(1)), float(t_m.group(2)), float(t_m.group(3))] if t_m else None
+                        rot   = [float(r_m.group(1)), float(r_m.group(2)), float(r_m.group(3)), float(r_m.group(4))] if r_m else None
+                        scale = [float(s_m.group(1)), float(s_m.group(2)), float(s_m.group(3))] if s_m else None
+                        combined_mat = transform_stack[-1][1] @ _get_matrix(trans, rot, scale)
+                        transform_stack.append((n_pos, combined_mat))
+                        i += 1; continue
+                    elif dtype == 'Coordinate':
+                        b_s, b_e = _bracket_range(content, _RE_POINT_OPEN, start, n_pos)
+                        if b_s != -1:
+                            vf = _parse_floats_range(content, b_s, b_e)
+                            if vf.size > 0 and vf.size % 3 == 0: def_map[name] = vf.reshape(-1, 3)
+                    elif dtype == 'IndexedFaceSet':
+                        res = _extract_geometry_range(content, start, n_pos, def_map)
+                        if res: def_map[name] = res
+                    elif dtype == 'Shape':
+                        res = _extract_shape_data_range(content, start, n_pos, def_map)
+                        if res:
+                            def_map[name] = res
+                            v, f, c = res
+                            if f is not None:
+                                vert_chunks.append(_apply_transform(v, transform_stack[-1][1]))
+                                face_chunks.append(f + v_offset)
+                                color_chunks.append(gpu_accel.tile_color(c, len(f)))
+                                v_offset += len(v); mesh_count += 1
+                    # Skip leaf DEFs
+                    while i < total_kw and matches[i].start() < n_pos: i += 1
+                    continue
+            i += 1; continue
+            
+        elif kw == 'USE':
+            m_u = _RE_USE_LINE.match(content, start)
+            if m_u:
+                name = m_u.group('name')
+                if name in def_map:
+                    res = def_map[name]
+                    if isinstance(res, tuple) and len(res) == 3:
+                        v, f, c = res
+                        if f is not None:
+                            vert_chunks.append(_apply_transform(v, transform_stack[-1][1]))
+                            face_chunks.append(f + v_offset)
+                            color_chunks.append(gpu_accel.tile_color(c, len(f)))
+                            v_offset += len(v); mesh_count += 1
+            i += 1; continue
+            
+        elif kw == 'Shape':
+            n_pos = _block_end(content, start)
+            if n_pos != -1:
+                res = _extract_shape_data_range(content, start, n_pos, def_map)
+                if res:
+                    v, f, c = res
+                    if f is not None:
+                        vert_chunks.append(_apply_transform(v, transform_stack[-1][1]))
+                        face_chunks.append(f + v_offset)
+                        color_chunks.append(gpu_accel.tile_color(c, len(f)))
+                        v_offset += len(v); mesh_count += 1
+                while i < total_kw and matches[i].start() < n_pos: i += 1
                 continue
+        i += 1
+        if time.time() - last_log > 10:
+            log.info("  ... %d%% keywords (%d shapes)", int(i/total_kw*100), mesh_count)
+            last_log = time.time()
 
-            vertices, faces, color = result
-            n_faces = len(faces)
-
-            vert_chunks.append(vertices)
-            face_chunks.append(faces + v_offset)
-            color_chunks.append(gpu_accel.tile_color(color, n_faces))
-            v_offset   += len(vertices)
-            mesh_count += 1
-
-            if mesh_count % 5_000 == 0:
-                log.info("  … %d shapes accumulated", mesh_count)
-
-        except Exception as exc:
-            skip_count += 1
-            if skip_count <= 5:
-                log.warning("Skipped shape %d: %s", mesh_count + skip_count, exc)
-
-    log.info("Accumulated %d shapes (%d skipped) — merging into one mesh …",
-             mesh_count, skip_count)
-
-    if not vert_chunks:
-        log.warning("No geometry found — returning empty scene")
-        return trimesh.Scene()
-
-    # ── GPU-accelerated chunk merge ───────────────────────────────────────────
-    log.info("Merging %d vertex chunks on %s …",
-             len(vert_chunks), "GPU" if gpu_accel.GPU_AVAILABLE else "CPU")
-    all_vertices    = gpu_accel.concatenate_chunks(vert_chunks,  axis=0)
-    all_faces       = gpu_accel.concatenate_chunks(face_chunks,  axis=0)
-    all_face_colors = gpu_accel.concatenate_chunks(color_chunks, axis=0)
-
-    log.info("Merged: %s vertices, %s triangles",
-             f"{len(all_vertices):,}", f"{len(all_faces):,}")
-
-    del vert_chunks, face_chunks, color_chunks
-
-    merged = trimesh.Trimesh(
-        vertices=all_vertices,
-        faces=all_faces,
-        process=False,
-    )
-    merged.visual.face_colors = all_face_colors
-
+    log.info("Step 5/6: Accumulation Done. Shapes: %d", mesh_count)
+    if not vert_chunks: return trimesh.Scene()
+    
+    log.info("Step 6/6: GPU Merge...")
+    all_v = gpu_accel.concatenate_chunks(vert_chunks, 0)
+    all_f = gpu_accel.concatenate_chunks(face_chunks, 0)
+    all_c = gpu_accel.concatenate_chunks(color_chunks, 0)
+    
+    merged = trimesh.Trimesh(vertices=all_v, faces=all_f, process=False)
+    merged.visual.face_colors = all_c
     scene = trimesh.Scene()
     scene.add_geometry(merged, geom_name='layout')
-    log.info("Scene ready — 1 merged mesh, passing to GLB exporter …")
+    log.info("Total conversion: %.2f s", time.time() - t0)
     return scene
