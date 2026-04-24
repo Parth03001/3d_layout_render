@@ -335,7 +335,7 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
 
     camera.position.set(
       center.x + distance * 0.7,
-      center.y + distance * 0.5,
+      center.y + distance * 0.7,
       center.z + distance * 0.7
     );
     camera.near = distance * 0.001;
@@ -470,6 +470,8 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
               (p) => { if (!cancelled) onLoadProgress?.({ phase: 'building', progress: p }); }
             );
           if (cancelled) return;
+          // trimesh exports GLB in Y-up; rotate to match the Z-up viewer
+          gltfScene.rotation.x = Math.PI / 2;
           modelGroup.add(gltfScene);
           fitCameraToModel();
           onLoadComplete?.({ meshCount, triangles: totalTriangles, vertices: totalVertices, warning: null });
@@ -504,6 +506,8 @@ function Viewer3D({ modelUrl, modelType, onLoadStart, onLoadComplete, onLoadErro
           );
           if (cancelled) return;
 
+          // THREE.VRMLLoader outputs Y-up; rotate to match the Z-up viewer
+          group.rotation.x = Math.PI / 2;
           modelGroup.add(group);
           fitCameraToModel();
           onLoadComplete?.({ meshCount, triangles: totalTriangles, vertices: totalVertices, warning: null });
